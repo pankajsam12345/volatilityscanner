@@ -1,0 +1,104 @@
+services:
+  db:
+    image: timescale/timescaledb:latest-pg16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: volscanner
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  backend:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@db:5432/volscanner
+      REDIS_URL: redis://redis:6379/0
+      CORS_ORIGINS: '["http://localhost:3000"]'
+      RUN_SEED: "true"
+      JWT_SECRET_KEY: dev-only-change-me-before-any-real-deployment
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/api/healthz', timeout=3).status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      # First boot runs scripts/seed.py synchronously before uvicorn even
+      # starts listening (see backend/entrypoint.sh) — at the ~5-year
+      # (1260-day analysis window) history depth this now takes ~2 min/
+      # symbol x 3 symbols, so start_period needs real headroom above that
+      # or celery-worker/celery-beat/frontend (which all depend on
+      # backend's healthcheck) never start on a fresh `docker compose up`.
+      start_period: 600s
+      retries: 8
+
+  celery-worker:
+    build: ./backend
+    command: celery -A app.tasks.celery_app worker --loglevel=info
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@db:5432/volscanner
+      REDIS_URL: redis://redis:6379/0
+      RUN_SEED: "false"
+      JWT_SECRET_KEY: dev-only-change-me-before-any-real-deployment
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.tasks.celery_app inspect ping -d celery@$$HOSTNAME | grep -q OK"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 5
+
+  celery-beat:
+    build: ./backend
+    command: celery -A app.tasks.celery_app beat --loglevel=info
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@db:5432/volscanner
+      REDIS_URL: redis://redis:6379/0
+      RUN_SEED: "false"
+      JWT_SECRET_KEY: dev-only-change-me-before-any-real-deployment
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        NEXT_PUBLIC_API_URL: http://localhost:8000/api
+    ports:
+      - "3000:3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"require('http').get('http://localhost:3000/', r => process.exit(r.statusCode < 500 ? 0 : 1)).on('error', () => process.exit(1))\""]
+      interval: 15s
+      timeout: 5s
+      start_period: 20s
+      retries: 5
+
+volumes:
+  db_data:
